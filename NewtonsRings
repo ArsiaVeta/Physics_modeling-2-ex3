@@ -1,0 +1,400 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+
+plt.rcParams['font.family']  = 'DejaVu Sans'
+plt.rcParams['axes.grid']    = True
+plt.rcParams['grid.alpha']   = 0.3
+
+# 1. ПАРАМЕТРЫ
+R_LENS   = 1.0        # радиус кривизны линзы, м
+R_MAX_MM = 5.0        # отображаемый радиус, мм
+NPIX     = 800        # разрешение картинки (NPIX × NPIX)
+NLINE    = 4000       # точек на радиальном срезе I(r)
+NLAM     = 81         # сколько длин волн брать при интегрировании спектра
+
+# 2. ДЛИНА ВОЛНЫ → RGB 
+def wavelength_to_rgb(lam_nm):
+    """λ (нм) → нормированный кортеж (R, G, B) ∈ [0, 1]³."""
+    w = float(lam_nm)
+    if   380 <= w < 440: r, g, b = -(w - 440) / 60, 0.0, 1.0
+    elif 440 <= w < 490: r, g, b = 0.0, (w - 440) / 50, 1.0
+    elif 490 <= w < 510: r, g, b = 0.0, 1.0, -(w - 510) / 20
+    elif 510 <= w < 580: r, g, b = (w - 510) / 70, 1.0, 0.0
+    elif 580 <= w < 645: r, g, b = 1.0, -(w - 645) / 65, 0.0
+    elif 645 <= w <= 780: r, g, b = 1.0, 0.0, 0.0
+    else: r, g, b = 0.0, 0.0, 0.0
+
+    # коррекция яркости на краях видимого диапазона
+    if   380 <= w < 420: factor = 0.3 + 0.7 * (w - 380) / 40
+    elif 420 <= w < 700: factor = 1.0
+    elif 700 <= w <= 780: factor = 0.3 + 0.7 * (780 - w) / 80
+    else: factor = 0.0
+    return np.array([r, g, b]) * factor
+
+# 3. РАСЧЁТ КАРТИН
+def intensity_field(R_lens, lam_m, n_pix=NPIX, r_max_mm=R_MAX_MM):
+    """I(x, y) для одной длины волны (без цвета). Размер n_pix × n_pix."""
+    x = np.linspace(-r_max_mm, r_max_mm, n_pix) * 1e-3   # → м
+    X, Y = np.meshgrid(x, x)
+    r2   = X*X + Y*Y                                     # r², м²
+    # I = sin²(π r² / (λ R))      — нормировано так, что I_max = 1
+    return np.sin(np.pi * r2 / (lam_m * R_lens))**2
+
+def intensity_radial(R_lens, lam_m, r_max_mm=R_MAX_MM, n=NLINE):
+    """I(r) — одномерный профиль для одной длины волны."""
+    r = np.linspace(0, r_max_mm, n) * 1e-3
+    return r*1e3, np.sin(np.pi * r**2 / (lam_m * R_lens))**2
+
+def gaussian_spectrum(lam_c_nm, dlam_nm, n=NLAM, n_sigma=2.5):
+    """Дискретный гауссов спектр: возвращает (λ_i [нм], веса w_i)."""
+    if dlam_nm <= 0:
+        return np.array([lam_c_nm]), np.array([1.0])
+    sigma = dlam_nm / (2*np.sqrt(2*np.log(2)))           # FWHM → σ
+    lams  = np.linspace(lam_c_nm - n_sigma*sigma,
+                        lam_c_nm + n_sigma*sigma, n)
+    w     = np.exp(-(lams - lam_c_nm)**2 / (2*sigma**2))
+    w    /= w.sum()                                      # ∑ w = 1
+    return lams, w
+
+def rings_color_image(R_lens, lam_c_nm, dlam_nm, n_pix=NPIX, r_max_mm=R_MAX_MM):
+    """Цветное 2D-изображение колец для (квази)монохроматического света."""
+    lams, weights = gaussian_spectrum(lam_c_nm, dlam_nm)
+    img = np.zeros((n_pix, n_pix, 3))
+    for lam_nm, w in zip(lams, weights):
+        I   = intensity_field(R_lens, lam_nm*1e-9, n_pix, r_max_mm)
+        rgb = wavelength_to_rgb(lam_nm)
+        img += w * I[..., None] * rgb[None, None, :]
+    return img
+
+def rings_radial_profile(R_lens, lam_c_nm, dlam_nm,
+                         r_max_mm=R_MAX_MM, n=NLINE):
+    """I(r) для (квази)монохроматического света — интеграл по спектру."""
+    lams, weights = gaussian_spectrum(lam_c_nm, dlam_nm)
+    r = np.linspace(0, r_max_mm, n) * 1e-3
+    I = np.zeros_like(r)
+    for lam_nm, w in zip(lams, weights):
+        I += w * np.sin(np.pi * r**2 / (lam_nm*1e-9 * R_lens))**2
+    return r*1e3, I
+
+# 4. СПРАВОЧНЫЕ РАСЧЁТЫ ДЛЯ ОТЧЁТА
+def ring_radii(R_lens, lam_nm, max_m=10, kind='dark'):
+    """Радиусы первых N тёмных или светлых колец, мм."""
+    lam = lam_nm * 1e-9
+    if kind == 'dark':
+        m = np.arange(0, max_m+1)
+        r2 = m * lam * R_lens
+    else:
+        m = np.arange(0, max_m+1)
+        r2 = (m + 0.5) * lam * R_lens
+    return np.sqrt(r2) * 1e3   # → мм
+
+def coherence_estimate(lam_c_nm, dlam_nm):
+    """Длина когерентности L_c = λ²/Δλ и примерное число видимых колец."""
+    if dlam_nm == 0:
+        return float('inf'), float('inf')
+    L_c   = (lam_c_nm)**2 / dlam_nm * 1e-9 
+    m_max = lam_c_nm / dlam_nm
+    return L_c, m_max
+
+# 5. ГРАФИКИ
+
+# Рис. 1. Схема установки
+def fig_setup_scheme():
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    ax.set_aspect('equal')
+    ax.set_xlim(-5.5, 5.5); ax.set_ylim(-2.0, 4.5)
+
+    # Плоская стеклянная пластина (внизу)
+    plate_top = 0.0
+    ax.fill_between([-5.2, 5.2], -1.6, plate_top,
+                    color='#cfe4ff', alpha=0.5, ec='black', lw=1.2)
+    ax.text(0, -0.8, 'плоская стеклянная пластина',
+            fontsize=10, color='#1f4e79', ha='center')
+
+    # Плоско-выпуклая линза (с большой кривизной снизу)
+    # масштабируем дугу так, чтобы зазор был хорошо виден
+    R_show = 25.0          # радиус кривизны в условных единицах
+    half_w = 5.0           # полуширина линзы
+    x_arc  = np.linspace(-half_w, half_w, 400)
+    # нижняя поверхность линзы: y = R - √(R² − x²) + зазор_0
+    y_bot  = R_show - np.sqrt(R_show**2 - x_arc**2) + plate_top + 0.05
+    y_top  = np.full_like(x_arc, 3.2)
+    # боковые рёбра
+    x_lens = np.concatenate([x_arc, x_arc[::-1]])
+    y_lens = np.concatenate([y_bot, y_top[::-1]])
+    ax.fill(x_lens, y_lens, color='#cfe4ff', alpha=0.5, ec='black', lw=1.2)
+    ax.text(0, 2.3, 'плоско-выпуклая линза',
+            fontsize=10, color='#1f4e79', ha='center')
+
+    # Воздушный зазор (между линзой и пластиной)
+    ax.fill_between(x_arc, plate_top, y_bot, color='#fff8e0',
+                    alpha=0.8, ec=None)
+    ax.text(0, 0.32, 'воздушный зазор d(r)',
+            fontsize=9, color='#7d6608', ha='center', style='italic')
+
+    # Падающий луч
+    x_hit = -2.2
+    y_hit_lens_bot = R_show - np.sqrt(R_show**2 - x_hit**2) + 0.05
+    ax.annotate('', xy=(x_hit, 3.6),
+                xytext=(x_hit - 0.6, 4.3),
+                arrowprops=dict(arrowstyle='-', lw=1.5, color='#c0392b'))
+    ax.annotate('', xy=(x_hit, y_hit_lens_bot),
+                xytext=(x_hit, 3.6),
+                arrowprops=dict(arrowstyle='->', lw=1.5, color='#c0392b'))
+    ax.text(x_hit - 0.7, 4.0, 'падающий\nсвет',
+            fontsize=10, color='#c0392b', ha='right')
+
+    # Отражённый луч 1: от нижней поверхности линзы (без π-сдвига)
+    ax.annotate('', xy=(x_hit - 1.6, 4.3),
+                xytext=(x_hit, y_hit_lens_bot),
+                arrowprops=dict(arrowstyle='->', lw=1.5, color='#27ae60'))
+    ax.text(x_hit - 1.85, 3.65,
+            '①  отр. от линзы\n     (без π-сдвига)',
+            fontsize=9, color='#27ae60', ha='left')
+
+    # Прошедший в воздух и отражённый от пластины (с π-сдвигом)
+    # точка отражения на пластине строго под точкой входа
+    ax.annotate('', xy=(x_hit, plate_top),
+                xytext=(x_hit, y_hit_lens_bot),
+                arrowprops=dict(arrowstyle='->', lw=1.0,
+                                color='#2980b9', alpha=0.6, ls='--'))
+    ax.annotate('', xy=(x_hit + 1.6, 4.3),
+                xytext=(x_hit, plate_top),
+                arrowprops=dict(arrowstyle='->', lw=1.5, color='#2980b9'))
+    ax.text(x_hit + 1.8, 3.65,
+            '②  отр. от пластины\n     (фазовый сдвиг π)',
+            fontsize=9, color='#2980b9', ha='left')
+
+    # Обозначения d(r), r, R
+    # d(r) — двунаправленная стрелка
+    x_d = 3.5
+    y_bot_at_xd = R_show - np.sqrt(R_show**2 - x_d**2) + 0.05
+    ax.annotate('', xy=(x_d, plate_top), xytext=(x_d, y_bot_at_xd),
+                arrowprops=dict(arrowstyle='<->', color='black', lw=1.0))
+    ax.text(x_d + 0.15, (plate_top + y_bot_at_xd)/2,
+            r'$d(r)$', fontsize=12)
+
+    # r — от центра контакта до точки на пластине
+    ax.annotate('', xy=(x_d, -1.85), xytext=(0, -1.85),
+                arrowprops=dict(arrowstyle='<->', color='black', lw=1.0))
+    ax.text(x_d/2, -1.7, r'$r$', fontsize=12, ha='center')
+
+    # точка контакта
+    ax.plot(0, 0, 'ko', ms=5)
+    ax.text(0.15, -0.15, 'точка\nконтакта', fontsize=8,
+            color='#555555', ha='left', va='top')
+
+    # Радиус кривизны R — подпись рядом с дугой
+    ax.annotate('', xy=(-3.5, 0.50), xytext=(-3.5, 0.05),
+                arrowprops=dict(arrowstyle='<-', color='gray',
+                                lw=0.8))
+    ax.text(-3.4, 0.30, r'$R \gg r$',
+            fontsize=10, color='gray', ha='left')
+
+    ax.set_title('Рис. 1. Геометрия установки колец Ньютона',
+                 fontsize=12, pad=10)
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.grid(False)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    fig.tight_layout()
+    fig.savefig('fig1_scheme.png', dpi=140, bbox_inches='tight')
+    plt.close(fig)
+
+# Рис. 2. Монохроматические кольца для трёх λ
+def fig_mono_three():
+    wavelengths = [450, 550, 633]
+    titles      = ['λ = 450 нм (синий)',
+                   'λ = 550 нм (зелёный)',
+                   'λ = 633 нм (красный, He–Ne)']
+
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.7))
+    for ax, lam, ttl in zip(axes, wavelengths, titles):
+        img = rings_color_image(R_LENS, lam, 0.0, n_pix=NPIX)
+        # нормировка пиксель-в-пиксель
+        img = np.clip(img / img.max(), 0, 1)
+        ax.imshow(img, extent=[-R_MAX_MM, R_MAX_MM, -R_MAX_MM, R_MAX_MM],
+                  origin='lower', interpolation='bilinear')
+        ax.set_title(ttl)
+        ax.set_xlabel('x, мм'); ax.set_ylabel('y, мм')
+        ax.grid(False)
+    fig.suptitle('Рис. 2. Монохроматические кольца Ньютона (R = 1 м)',
+                 y=1.02, fontsize=13)
+    fig.tight_layout()
+    fig.savefig('fig2_mono.png', dpi=140, bbox_inches='tight')
+    plt.close(fig)
+
+# Рис. 3. Радиальный профиль I(r) — монохроматический
+def fig_mono_radial():
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5),
+                                    gridspec_kw={'width_ratios':[1, 1]})
+    for lam, color in zip([450, 550, 633], ['#3050ff', '#33aa33', '#cc2222']):
+        r, I = rings_radial_profile(R_LENS, lam, 0.0)
+        ax1.plot(r, I, lw=1.4, color=color, label=f'λ = {lam} нм')
+        ax2.plot(r, I, lw=0.8, color=color, label=f'λ = {lam} нм', alpha=0.85)
+        # позиции тёмных колец
+        rd = ring_radii(R_LENS, lam, max_m=8, kind='dark')
+        ax1.scatter(rd[1:], np.zeros_like(rd[1:]), s=22, color=color, zorder=5)
+
+    for ax in (ax1, ax2):
+        ax.set_xlabel('r, мм'); ax.set_ylabel('I / I_max')
+        ax.legend(loc='upper right'); ax.set_ylim(-0.05, 1.1)
+    ax1.set_xlim(0, 2.0); ax1.set_title('а) первые ~6 порядков (детально)')
+    ax2.set_xlim(0, R_MAX_MM);  ax2.set_title('б) общий вид до 5 мм')
+    fig.suptitle('Рис. 3. Радиальная зависимость интенсивности — '
+                 'монохроматический случай', y=1.02, fontsize=12)
+    fig.tight_layout()
+    fig.savefig('fig3_mono_radial.png', dpi=140, bbox_inches='tight')
+    plt.close(fig)
+
+# Рис. 4. Квазимонохроматический: 4 ширины спектра
+def fig_quasi_grid():
+    cases = [(550, 0,   'Δλ = 0 (монохроматический)'),
+             (550, 10,  'Δλ = 10 нм (узкий, типа LED)'),
+             (550, 50,  'Δλ = 50 нм'),
+             (550, 100, 'Δλ = 100 нм (широкий)')]
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 10))
+    for ax, (lam, dlam, ttl) in zip(axes.flat, cases):
+        img = rings_color_image(R_LENS, lam, dlam, n_pix=NPIX)
+        img = np.clip(img / max(img.max(), 1e-12), 0, 1)
+        ax.imshow(img, extent=[-R_MAX_MM, R_MAX_MM, -R_MAX_MM, R_MAX_MM],
+                  origin='lower', interpolation='bilinear')
+        if dlam > 0:
+            m_max = lam / dlam
+            ttl += f'\n(видно ~{m_max:.0f} колец)'
+        ax.set_title(ttl)
+        ax.set_xlabel('x, мм'); ax.set_ylabel('y, мм')
+        ax.grid(False)
+    fig.suptitle(f'Рис. 4. Квазимонохроматический свет, λ₀ = 550 нм (R = {R_LENS} м)',
+                 y=1.00, fontsize=13)
+    fig.tight_layout()
+    fig.savefig('fig4_quasi_grid.png', dpi=140, bbox_inches='tight')
+    plt.close(fig)
+
+# Рис. 5. Радиальные профили для разных Δλ
+def fig_quasi_radial():
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    cases = [(0,   '#000000', 'Δλ = 0'),
+             (10,  '#1f4e79', 'Δλ = 10 нм'),
+             (50,  '#c0392b', 'Δλ = 50 нм'),
+             (100, '#f39c12', 'Δλ = 100 нм')]
+    for dlam, color, lbl in cases:
+        r, I = rings_radial_profile(R_LENS, 550, dlam)
+        ax.plot(r, I, lw=1.1, color=color, alpha=0.9, label=lbl)
+    ax.set_xlabel('r, мм'); ax.set_ylabel('⟨I⟩ / I_max')
+    ax.set_title('Рис. 5. Радиальная зависимость для разных ширин спектра '
+                 '(λ₀ = 550 нм)')
+    ax.legend(loc='upper right')
+    ax.set_xlim(0, R_MAX_MM); ax.set_ylim(-0.05, 1.05)
+    fig.tight_layout()
+    fig.savefig('fig5_quasi_radial.png', dpi=140)
+    plt.close(fig)
+
+# Рис. 6. «Белый свет» — широкий видимый спектр
+def fig_white():
+    """Классическая картина Ньютоновских колец в «белом» свете."""
+    # спектр D65-подобный, упрощённо: равномерно от 400 до 700 нм
+    lams = np.linspace(400, 700, 121)
+    weights = np.ones_like(lams) / len(lams)
+
+    n_pix = NPIX
+    img = np.zeros((n_pix, n_pix, 3))
+    for lam_nm, w in zip(lams, weights):
+        I   = intensity_field(R_LENS, lam_nm*1e-9, n_pix, R_MAX_MM)
+        rgb = wavelength_to_rgb(lam_nm)
+        img += w * I[..., None] * rgb[None, None, :]
+    img = np.clip(img / img.max(), 0, 1)
+
+    # радиальный профиль для «белого света»
+    r = np.linspace(0, R_MAX_MM, NLINE) * 1e-3
+    I_r = np.zeros_like(r)
+    for lam_nm, w in zip(lams, weights):
+        I_r += w * np.sin(np.pi * r**2 / (lam_nm*1e-9 * R_LENS))**2
+
+    fig = plt.figure(figsize=(12.5, 5.3))
+    gs  = GridSpec(1, 2, width_ratios=[1, 1.2], wspace=0.25)
+
+    ax_img = fig.add_subplot(gs[0])
+    ax_img.imshow(img, extent=[-R_MAX_MM, R_MAX_MM, -R_MAX_MM, R_MAX_MM],
+                  origin='lower', interpolation='bilinear')
+    ax_img.set_title('а) кольца в «белом» свете (400–700 нм)')
+    ax_img.set_xlabel('x, мм'); ax_img.set_ylabel('y, мм')
+    ax_img.grid(False)
+
+    ax_pl = fig.add_subplot(gs[1])
+    ax_pl.plot(r*1e3, I_r, lw=1.0, color='#333333')
+    ax_pl.set_xlabel('r, мм'); ax_pl.set_ylabel('⟨I⟩ / I_max')
+    ax_pl.set_title('б) радиальная зависимость интенсивности')
+    ax_pl.set_xlim(0, R_MAX_MM); ax_pl.set_ylim(0, 1.0)
+
+    fig.suptitle('Рис. 6. Кольца Ньютона в «белом» свете', y=1.02, fontsize=13)
+    fig.tight_layout()
+    fig.savefig('fig6_white.png', dpi=140, bbox_inches='tight')
+    plt.close(fig)
+
+# Рис. 7. Видимость как функция порядка кольца
+def fig_visibility():
+    """V(m) = (I_max - I_min)/(I_max + I_min) — функция видимости."""
+    fig, ax = plt.subplots(figsize=(10, 5))
+    m_arr = np.arange(0, 100)
+    for dlam, color in [(10, '#1f4e79'), (50, '#c0392b'), (100, '#f39c12')]:
+        # V(m) = |sinc(m π Δλ / λ)|  (для равномерного спектра)
+        # для гауссова: V(m) = exp(-(π m Δλ/λ)² / (8 ln2))
+        lam0 = 550.0
+        # точная формула для гауссова спектра:
+        sigma = dlam / (2*np.sqrt(2*np.log(2)))
+        V = np.exp(-2*(np.pi * m_arr * sigma / lam0)**2)
+        ax.plot(m_arr, V, lw=1.4, color=color,
+                label=f'Δλ = {dlam} нм (λ/Δλ = {lam0/dlam:.0f})')
+    ax.axhline(1/np.e, color='gray', ls=':', label='1/e')
+    ax.set_xlabel('порядок кольца m')
+    ax.set_ylabel('V(m)')
+    ax.set_title('Рис. 7. Видимость колец в зависимости от порядка m '
+                 '(гауссов спектр, λ₀ = 550 нм)')
+    ax.legend(loc='upper right')
+    ax.set_xlim(0, 100); ax.set_ylim(0, 1.05)
+    fig.tight_layout()
+    fig.savefig('fig7_visibility.png', dpi=140)
+    plt.close(fig)
+
+# 6. ОСНОВНАЯ ПРОГРАММА
+if __name__ == '__main__':
+    print("=" * 64)
+    print("Моделирование колец Ньютона")
+    print("=" * 64)
+    print(f"  Радиус кривизны линзы  R       = {R_LENS} м")
+    print(f"  Область отображения    ±r_max  = {R_MAX_MM} мм")
+    print(f"  Разрешение             N×N     = {NPIX} × {NPIX} пикс.")
+    print()
+
+    print("Радиусы первых тёмных колец (мм), R = 1 м:")
+    print(f"  {'m':>3} | {'λ=450 нм':>10} | {'λ=550 нм':>10} | {'λ=633 нм':>10}")
+    print("  " + "-"*48)
+    for lam in [450, 550, 633]:
+        pass
+    for m in range(1, 11):
+        r450 = np.sqrt(m * 450e-9 * R_LENS) * 1e3
+        r550 = np.sqrt(m * 550e-9 * R_LENS) * 1e3
+        r633 = np.sqrt(m * 633e-9 * R_LENS) * 1e3
+        print(f"  {m:>3} | {r450:>10.4f} | {r550:>10.4f} | {r633:>10.4f}")
+
+    print()
+    print("Оценка числа видимых колец при λ₀ = 550 нм:")
+    for dlam in [10, 50, 100]:
+        Lc = (550e-9)**2 / (dlam*1e-9) * 1e6   # → мкм
+        m  = 550 / dlam
+        print(f"  Δλ = {dlam:>3} нм  →  L_c = {Lc:>7.2f} мкм,  m_max ≈ {m:>5.1f}")
+
+    print()
+    print("Построение графиков …")
+    fig_setup_scheme()      ; print("  ✓ fig1_scheme.png")
+    fig_mono_three()        ; print("  ✓ fig2_mono.png")
+    fig_mono_radial()       ; print("  ✓ fig3_mono_radial.png")
+    fig_quasi_grid()        ; print("  ✓ fig4_quasi_grid.png")
+    fig_quasi_radial()      ; print("  ✓ fig5_quasi_radial.png")
+    fig_white()             ; print("  ✓ fig6_white.png")
+    fig_visibility()        ; print("  ✓ fig7_visibility.png")
+    print()
+    print("Готово.")
